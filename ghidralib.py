@@ -326,7 +326,7 @@ class GhidraWrapper(object):
 if TYPE_CHECKING:
     Addr = GenericAddress | int | str
     """This library accepts one of three things as addressses:
-    1. A Ghidra Address object
+    1. A Ghidra GenericAddress object
     2. An integer representing an address
     3. A string representing a symbol name
     When returning a value, the address is always returned as an integer."""
@@ -898,9 +898,9 @@ class Varnode(GhidraWrapper):
         """Get the value of this varnode. Traverse defining pcodeops if necessary."""
         if self.is_address or self.is_constant:
             return self.offset
-        if self.defining_pcodeop is None:
+        if self.defining_op is None:
             return None
-        return self.defining_pcodeop.result
+        return self.defining_op.result
 
     @property
     def offset(self):  # type: () -> int
@@ -1025,12 +1025,32 @@ class Varnode(GhidraWrapper):
         return self.raw.isFree()
 
     @property
-    def defining_pcodeop(self):  # type: () -> PcodeOp|None
-        """Return a PcodeOp that defined this varnode"""
+    def maybe_defining_op(self):  # type: () -> PcodeOp|None
+        """Return a PcodeOp that defined this varnode, or None for free Varnodes.
+
+        VarnodeAST (from PcodeOpAST from HighFunctions) are guaranteed
+        to return a non-null PcodeOp.
+        
+        Wraps getDef, but `def` is not a valid Python name."""
         raw = self.raw.getDef()
         if raw is None:
             return None
         return PcodeOp(raw)
+
+    @property
+    def defining_op(self):  # type: () -> PcodeOp
+        """Return a PcodeOp that defined this varnode, or raises an exception.
+
+        VarnodeAST (from PcodeOpAST from HighFunctions) are guaranteed to have it.
+
+        If you don't want an exception on failure, use maybe_defining_op. I think in
+        99% of cases programmer knows they're dealing with high pcode, and this works.
+
+        Wraps getDef, but `def` is not a valid Python name."""
+        op = self.maybe_defining_op
+        if op is None:
+            raise RuntimeError("This varnode has no defining PcodeOp")
+        return op
 
     @property
     def descendants(self):  # type: () -> list[PcodeOp]
@@ -1042,6 +1062,15 @@ class Varnode(GhidraWrapper):
     def intersects(self, other):  # type: (Varnode) -> list[PcodeOp]
         """Return true if this varnode intersects other"""
         return self.raw.intersects(other.raw)
+
+    @property
+    def lone_descend(self):  # type: () -> PcodeOp | None
+        """If there is only one PCodeOp that takes this varnode as input,
+        return it. Otherwise, return None."""
+        result = self.raw.getLoneDescend()
+        if result is None:
+            return None
+        return PcodeOp(result)
 
 
 class PcodeOp(GhidraWrapper):
@@ -1186,6 +1215,11 @@ class PcodeOp(GhidraWrapper):
             return self.inputs[0].value
         return None
 
+    @property
+    def parent(self):  # type: () -> PcodeBlock
+        """Get the PcodeBlock that this operation belongs to."""
+        return _pcode_node(self.raw.getParent())
+
 
 def _pcode_node(raw):  # type: (JavaObject) -> PcodeBlock
     """Create a BlockGraph or PcodeBlock, depending on arg type
@@ -1200,12 +1234,44 @@ def _pcode_node(raw):  # type: (JavaObject) -> PcodeBlock
 
 class PcodeBlock(GhidraWrapper):
     @property
-    def outgoing_edges(self):  # type: () -> list[PcodeBlock]
+    def out_edges(self):  # type: () -> list[PcodeBlock]
+        """List of PcodeBlocks that can be reached from this node"""
         return [_pcode_node(self.raw.getOut(i)) for i in range(self.raw.getOutSize())]
 
     @property
-    def incoming_edges(self):  # type: () -> list[PcodeBlock]
+    def in_edges(self):  # type: () -> list[PcodeBlock]
+        """List of PcodeBlocks that can reached this node"""
         return [_pcode_node(self.raw.getIn(i)) for i in range(self.raw.getInSize())]
+
+    # These aliases are less clear, but I keep misremembering `out_edges`
+    # and typing `outputs` instead - so maybe it's a more natural name to use?
+    outputs = out_edges
+    inputs = in_edges
+
+    @property
+    def start(self):  # type: () -> int
+        """Returns the first address covered by this block."""
+        return self.raw.getStart().getOffset()
+
+    # For basically every other class we have `address` property with start, so: 
+    address = start
+
+    @property
+    def stop(self):  # type: () -> int
+        """Returns the last address covered by this block."""
+        return self.raw.getStop().getOffset()
+
+    @property
+    def true_out(self):  # type: () -> PcodeBlock
+        """If paths out of this block depend on a boolean condition,
+        returns the PcodeBlock coming if that condition is true."""
+        return PcodeBlock(self.raw.getTrueOut())
+
+    @property
+    def false_out(self):  # type: () -> PcodeBlock
+        """If paths out of this block depend on a boolean condition,
+        returns the PcodeBlock coming if that condition is true."""
+        return PcodeBlock(self.raw.getFalseOut())
 
     @property
     def has_children(self):  # type: () -> bool
@@ -1217,7 +1283,7 @@ class PcodeBlock(GhidraWrapper):
 
     @property
     def pcode(self):  # type: () -> list[PcodeOp]
-        raw_pcode = collect_iterator(self.raw.getRef().getIterator())
+        raw_pcode = collect_iterator(self.raw.getIterator())
         return [PcodeOp(raw) for raw in raw_pcode]
 
 
@@ -1289,12 +1355,12 @@ class HighFunction(GhidraWrapper):
         edge_map = {}
         ingraph = GhBlockGraph()
         for block in self.basicblocks:
-            gb = BlockCopy(block.raw, block.raw.getStart())
+            gb = BlockCopy(block.raw, toAddr(block.start))
             ingraph.addBlock(gb)
             edge_map[block.raw] = gb
 
         for block in self.basicblocks:
-            for edge in block.outgoing_edges:
+            for edge in block.out_edges:
                 ingraph.addEdge(edge_map[block.raw], edge_map[edge.raw])
 
         ingraph.setIndices()
@@ -1361,7 +1427,12 @@ class Reference(GhidraWrapper):
 
     @property
     def source(self):  # type: () -> SourceType
+        """Return a source type for this reference."""
         return SourceType(self.raw.getSource())
+
+    def set_primary(self):  # type: () -> None
+        """Set this reference as primary reference"""
+        Program.current().getReferenceManager().setPrimary(self.raw, True)
 
 
 def _reftype_placeholder():  # type: () -> RefType
@@ -1728,6 +1799,14 @@ class Instruction(GhidraWrapper, BodyTrait):
     def address(self):  # type: () -> int
         """Get the address of this instruction."""
         return self.raw.getAddress().getOffset()
+
+    # Alias from Ghidra
+    min_address = address
+
+    @property
+    def max_address(self):  # type: () -> int
+        """Get the last address of this instruction."""
+        return self.raw.getMaxAddress().getOffset()
 
     @property
     def operands(self):  # type: () -> list[Operand]
@@ -3798,7 +3877,7 @@ class Program(GhidraWrapper):
     def location():  # type: () -> int
         """Get the current location in the program.
 
-            >>> current_location()
+            >>> Program.location()
             0x1000
 
         :return: the current location in the program
