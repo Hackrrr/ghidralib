@@ -3,7 +3,7 @@ This library is an attempt to provide a Pythonic standard library for Ghidra.
 
 The main goal is to make writing quick&dirty scripts actually quick, and not that dirty.
 
-There is no equivalent of FlatProgramAPI from GHidra. You are expected to start
+There is no equivalent of FlatProgramAPI from Ghidra. You are expected to start
 by getting an object of interest by calling instance methods, for example
 
     >>> Function("main")
@@ -27,7 +27,6 @@ except ImportError:
     print("Visit https://ghidra-sre.org/ to download Ghidra.")
     exit(1)
 
-from abc import abstractmethod
 from ghidra.app.decompiler import (
     ClangSyntaxToken,
     ClangCommentToken,
@@ -36,14 +35,14 @@ from ghidra.app.decompiler import (
     DecompInterface,
 )
 from ghidra.app.services import DataTypeManagerService, GraphDisplayBroker
-from ghidra.app.util import PseudoDisassembler
+from ghidra.app.util import PseudoDisassembler, SearchConstants
+from ghidra.app.util.parser import FunctionSignatureParser
 from ghidra.app.util.cparser.C import CParser
 from ghidra.app.emulator import EmulatorHelper
 from ghidra.app.plugin.core.colorizer import ColorizingService
 from ghidra.app.plugin.assembler import Assemblers
 from ghidra.app.plugin.core.analysis import ConstantPropagationContextEvaluator
-from ghidra.app.cmd.function import CreateFunctionCmd
-from ghidra.app.util import SearchConstants
+from ghidra.app.cmd.function import CreateFunctionCmd, ApplyFunctionSignatureCmd
 from ghidra.util.task import TaskMonitor
 from ghidra.program.model.symbol import SourceType, RefType as GhRefType
 from ghidra.program.model.pcode import (
@@ -63,12 +62,16 @@ from ghidra.program.model.address import (
 )
 from ghidra.program.model.scalar import Scalar
 from ghidra.program.model.listing import ParameterImpl, Function as GhFunction, Data as GhData
+from ghidra.program.model.data import FunctionDefinitionDataType, ParameterDefinitionImpl
 from ghidra.program.util import SymbolicPropogator as GhSymbolicPropogator
 from ghidra.service.graph import GraphDisplayOptions, AttributedGraph, GraphType
+
 from java.awt import Color
 from java.util import ArrayList
 from java.math import BigInteger
+
 import sys
+from abc import abstractmethod
 
 
 __version__ = "0.2.0"
@@ -100,6 +103,7 @@ if sys.version_info.major == 2:
         disassemble,
         analyzeChanges,
         setBytes,
+        runCommand,
     )
 
     # Python2 specific type definitions
@@ -154,6 +158,7 @@ else:
     disassemble = get_current_interpreter().disassemble
     analyzeChanges = get_current_interpreter().analyzeChanges
     setBytes = get_current_interpreter().setBytes
+    runCommand = get_current_interpreter().runCommand
 
     # Python3 specific type definitions
     # The goal is to support both languages with a single codebase
@@ -1030,7 +1035,7 @@ class Varnode(GhidraWrapper):
 
         VarnodeAST (from PcodeOpAST from HighFunctions) are guaranteed
         to return a non-null PcodeOp.
-        
+
         Wraps getDef, but `def` is not a valid Python name."""
         raw = self.raw.getDef()
         if raw is None:
@@ -1253,7 +1258,7 @@ class PcodeBlock(GhidraWrapper):
         """Returns the first address covered by this block."""
         return self.raw.getStart().getOffset()
 
-    # For basically every other class we have `address` property with start, so: 
+    # For basically every other class we have `address` property with start, so:
     address = start
 
     @property
@@ -2653,6 +2658,68 @@ class Function(GhidraWrapper, BodyTrait):
         data = DataType(datatype)
         param = ParameterImpl(name, data.raw, reg.raw, Program.current())
         self.raw.addParameter(param, SourceType.USER_DEFINED)
+
+    def set_signature(
+        self, signature
+    ):  # type: (str) -> bool
+        """Change the signature of this function based on the C-like signature
+        as a string.
+
+        Note: The function name in the supplied signature is only applied if the
+        function does not yet have a user-defined name. Otherwise, the function
+        name will not change. This issue in Ghidra is tracked here:
+        https://github.com/NationalSecurityAgency/ghidra/issues/8930
+
+            >>> ghidralib.Function('main').set_signature(
+            >>>     'int main(int argc, char ** argv, char ** envp)'
+            >>> )
+
+        Returns whether the signature change was successful."""
+
+        # 'service' is None to only use types in the current program's data type
+        # manager
+        parser = FunctionSignatureParser(
+            Program.current().getDataTypeManager(),
+            None
+        )
+
+        # 'originalSignature' is None to replace the signature
+        sig = parser.parse(None, signature)
+
+        return runCommand(ApplyFunctionSignatureCmd(
+            resolve(self.entrypoint),
+            sig,
+            SourceType.USER_DEFINED
+        ))
+
+    def set_signature_detail(
+        self, ret, args
+    ):  # type: (DataType | DataT, list[tuple[DataType | DataT, str]]) -> bool
+        """Change the signature of this function based on a return data type and
+        a list of argument types and names.
+
+        If an argument has an empty string as name, a name will automatically
+        be assigned (like 'param_1', 'param_2', etc.).
+
+            >>> ghidralib.Function('main').set_signature_detail('int', [
+            >>>     ('int', 'argc'),
+            >>>     ('char **', 'argv'),
+            >>>     ('char **', 'envp'),
+            >>> ])
+
+        Returns whether the signature change was successful."""
+        sig = FunctionDefinitionDataType(self.name)
+        sig.setReturnType(DataType(ret).raw)
+        sig.setArguments([
+            ParameterDefinitionImpl(name, DataType(ty).raw, '')  # empty comment
+            for ty, name in args
+        ])
+
+        return runCommand(ApplyFunctionSignatureCmd(
+            resolve(self.entrypoint),
+            sig,
+            SourceType.USER_DEFINED
+        ))
 
     def fixup_body(self):  # type: () -> bool
         """Fixup the function body: follow control flow and add thunks."""
